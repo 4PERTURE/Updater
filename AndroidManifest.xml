@@ -37,6 +37,14 @@
                 <category android:name="com.android.settings.SHORTCUT" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+			<meta-data
+                android:name="com.android.settings.icon"
+                android:resource="@drawable/ic_system_update" />
+            <meta-data
+                android:name="com.android.settings.category"
+                android:value="com.android.settings.category.ia.homepage" />
+            <meta-data android:name="com.android.settings.summary"
+                android:resource="Check for a newer version of DerpFest" />
         </activity>
 
         <service android:name=".controller.UpdaterService" />
