@@ -15,7 +15,6 @@
  */
 package org.lineageos.updater;
 
-import android.app.ProgressDialog;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -25,32 +24,41 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.icu.text.DateFormat;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemProperties;
 import android.support.design.widget.AppBarLayout;
 import android.support.design.widget.CollapsingToolbarLayout;
 import android.support.design.widget.Snackbar;
 import android.support.v4.content.LocalBroadcastManager;
+import android.support.v7.app.AlertDialog;
 import android.support.v7.preference.PreferenceManager;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
 import android.support.v7.widget.SimpleItemAnimator;
 import android.support.v7.widget.Toolbar;
 import android.util.Log;
+import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.animation.Animation;
+import android.view.animation.LinearInterpolator;
+import android.view.animation.RotateAnimation;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 
 import org.json.JSONException;
-import org.lineageos.updater.controller.Controller;
 import org.lineageos.updater.controller.UpdaterController;
 import org.lineageos.updater.controller.UpdaterService;
 import org.lineageos.updater.download.DownloadClient;
 import org.lineageos.updater.misc.BuildInfoUtils;
 import org.lineageos.updater.misc.Constants;
-import org.lineageos.updater.misc.LegacySupport;
 import org.lineageos.updater.misc.StringGenerator;
 import org.lineageos.updater.misc.Utils;
 import org.lineageos.updater.model.UpdateInfo;
@@ -58,9 +66,8 @@ import org.lineageos.updater.model.UpdateInfo;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 public class UpdatesActivity extends UpdatesListActivity {
 
@@ -69,6 +76,9 @@ public class UpdatesActivity extends UpdatesListActivity {
     private BroadcastReceiver mBroadcastReceiver;
 
     private UpdatesListAdapter mAdapter;
+
+    private View mRefreshIconView;
+    private RotateAnimation mRefreshAnimation;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -118,6 +128,10 @@ public class UpdatesActivity extends UpdatesListActivity {
         headerBuildVersion.setText(
                 getString(R.string.header_android_version, Build.VERSION.RELEASE));
 
+        TextView headerDeviceName = (TextView) findViewById(R.id.header_device_name);
+        headerDeviceName.setText(
+                getString(R.string.list_device_name, BuildInfoUtils.getDevice()));
+
         TextView headerBuildDate = (TextView) findViewById(R.id.header_build_date);
         headerBuildDate.setText(StringGenerator.getDateLocalizedUTC(this,
                 DateFormat.LONG, BuildInfoUtils.getBuildDateTimestamp()));
@@ -146,6 +160,11 @@ public class UpdatesActivity extends UpdatesListActivity {
             // This can't be collapsed without a touchscreen
             appBar.setExpanded(false);
         }
+
+        mRefreshAnimation = new RotateAnimation(0, 360, Animation.RELATIVE_TO_SELF, 0.5f,
+                Animation.RELATIVE_TO_SELF, 0.5f);
+        mRefreshAnimation.setInterpolator(new LinearInterpolator());
+        mRefreshAnimation.setDuration(1000);
     }
 
     @Override
@@ -175,14 +194,6 @@ public class UpdatesActivity extends UpdatesListActivity {
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         getMenuInflater().inflate(R.menu.menu_toolbar, menu);
-        SharedPreferences preferences =
-                PreferenceManager.getDefaultSharedPreferences(this);
-        menu.findItem(R.id.menu_auto_updates_check)
-                .setChecked(preferences.getBoolean(Constants.PREF_AUTO_UPDATES_CHECK, true));
-        menu.findItem(R.id.menu_auto_delete_updates)
-                .setChecked(preferences.getBoolean(Constants.PREF_AUTO_DELETE_UPDATES, false));
-        menu.findItem(R.id.menu_mobile_data_warning)
-                .setChecked(preferences.getBoolean(Constants.PREF_MOBILE_DATA_WARNING, true));
         return super.onCreateOptionsMenu(menu);
     }
 
@@ -193,37 +204,14 @@ public class UpdatesActivity extends UpdatesListActivity {
                 downloadUpdatesList(true);
                 return true;
             }
-            case R.id.menu_auto_updates_check: {
-                boolean enable = !item.isChecked();
-                item.setChecked(enable);
-                PreferenceManager.getDefaultSharedPreferences(UpdatesActivity.this)
-                        .edit()
-                        .putBoolean(Constants.PREF_AUTO_UPDATES_CHECK, enable)
-                        .apply();
-                if (enable) {
-                    UpdatesCheckReceiver.scheduleRepeatingUpdatesCheck(this);
-                } else {
-                    UpdatesCheckReceiver.cancelRepeatingUpdatesCheck(this);
-                    UpdatesCheckReceiver.cancelUpdatesCheck(this);
-                }
+            case R.id.menu_preferences: {
+                showPreferencesDialog();
                 return true;
             }
-            case R.id.menu_auto_delete_updates: {
-                boolean enable = !item.isChecked();
-                item.setChecked(enable);
-                PreferenceManager.getDefaultSharedPreferences(UpdatesActivity.this)
-                        .edit()
-                        .putBoolean(Constants.PREF_AUTO_DELETE_UPDATES, enable)
-                        .apply();
-                return true;
-            }
-            case R.id.menu_mobile_data_warning: {
-                boolean enable = !item.isChecked();
-                item.setChecked(enable);
-                PreferenceManager.getDefaultSharedPreferences(UpdatesActivity.this)
-                        .edit()
-                        .putBoolean(Constants.PREF_MOBILE_DATA_WARNING, enable)
-                        .apply();
+            case R.id.menu_show_changelog: {
+                Intent openUrl = new Intent(Intent.ACTION_VIEW,
+                        Uri.parse(Utils.getChangelogURL(this)));
+                startActivity(openUrl);
                 return true;
             }
         }
@@ -258,24 +246,15 @@ public class UpdatesActivity extends UpdatesListActivity {
     private void loadUpdatesList(File jsonFile, boolean manualRefresh)
             throws IOException, JSONException {
         Log.d(TAG, "Adding remote updates");
-        Controller controller = mUpdaterService.getUpdaterController();
+        UpdaterController controller = mUpdaterService.getUpdaterController();
         boolean newUpdates = false;
 
         List<UpdateInfo> updates = Utils.parseJson(jsonFile, true);
-
-        List<String> importedNotAvailableOnline = LegacySupport.importDownloads(this, updates);
-
         List<String> updatesOnline = new ArrayList<>();
         for (UpdateInfo update : updates) {
             newUpdates |= controller.addUpdate(update);
             updatesOnline.add(update.getDownloadId());
         }
-
-        if (importedNotAvailableOnline != null) {
-            updatesOnline.removeAll(importedNotAvailableOnline);
-            controller.setUpdatesNotAvailableOnline(importedNotAvailableOnline);
-        }
-
         controller.setUpdatesAvailableOnline(updatesOnline, true);
 
         if (manualRefresh) {
@@ -292,12 +271,7 @@ public class UpdatesActivity extends UpdatesListActivity {
         } else {
             findViewById(R.id.no_new_updates_view).setVisibility(View.GONE);
             findViewById(R.id.recycler_view).setVisibility(View.VISIBLE);
-            Collections.sort(sortedUpdates, new Comparator<UpdateInfo>() {
-                @Override
-                public int compare(UpdateInfo u1, UpdateInfo u2) {
-                    return Long.compare(u2.getTimestamp(), u1.getTimestamp());
-                }
-            });
+            sortedUpdates.sort((u1, u2) -> Long.compare(u2.getTimestamp(), u1.getTimestamp()));
             for (UpdateInfo update : sortedUpdates) {
                 updateIds.add(update.getDownloadId());
             }
@@ -342,28 +316,19 @@ public class UpdatesActivity extends UpdatesListActivity {
 
     private void downloadUpdatesList(final boolean manualRefresh) {
         final File jsonFile = Utils.getCachedUpdateList(this);
-        final File jsonFileTmp = new File(jsonFile.getAbsolutePath() + ".tmp");
+        final File jsonFileTmp = new File(jsonFile.getAbsolutePath() + UUID.randomUUID());
         String url = Utils.getServerURL(this);
         Log.d(TAG, "Checking " + url);
-
-        final ProgressDialog progressDialog = new ProgressDialog(this);
-        progressDialog.setTitle(R.string.app_name);
-        progressDialog.setMessage(getString(R.string.dialog_checking_for_updates));
-        progressDialog.setIndeterminate(true);
-        progressDialog.setCancelable(true);
 
         DownloadClient.DownloadCallback callback = new DownloadClient.DownloadCallback() {
             @Override
             public void onFailure(final boolean cancelled) {
                 Log.e(TAG, "Could not download updates list");
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        progressDialog.dismiss();
-                        if (!cancelled) {
-                            showSnackbar(R.string.snack_updates_check_failed, Snackbar.LENGTH_LONG);
-                        }
+                runOnUiThread(() -> {
+                    if (!cancelled) {
+                        showSnackbar(R.string.snack_updates_check_failed, Snackbar.LENGTH_LONG);
                     }
+                    refreshAnimationStop();
                 });
             }
 
@@ -374,13 +339,10 @@ public class UpdatesActivity extends UpdatesListActivity {
 
             @Override
             public void onSuccess(File destination) {
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        Log.d(TAG, "List downloaded");
-                        processNewJson(jsonFile, jsonFileTmp, manualRefresh);
-                        progressDialog.dismiss();
-                    }
+                runOnUiThread(() -> {
+                    Log.d(TAG, "List downloaded");
+                    processNewJson(jsonFile, jsonFileTmp, manualRefresh);
+                    refreshAnimationStop();
                 });
             }
         };
@@ -398,14 +360,7 @@ public class UpdatesActivity extends UpdatesListActivity {
             return;
         }
 
-        progressDialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
-            @Override
-            public void onCancel(DialogInterface dialog) {
-                progressDialog.dismiss();
-                downloadClient.cancel();
-            }
-        });
-        progressDialog.show();
+        refreshAnimationStart();
         downloadClient.start();
     }
 
@@ -438,5 +393,94 @@ public class UpdatesActivity extends UpdatesListActivity {
     @Override
     public void showSnackbar(int stringId, int duration) {
         Snackbar.make(findViewById(R.id.main_container), stringId, duration).show();
+    }
+
+    private void refreshAnimationStart() {
+        if (mRefreshIconView == null) {
+            mRefreshIconView = findViewById(R.id.menu_refresh);
+        }
+        if (mRefreshIconView != null) {
+            mRefreshAnimation.setRepeatCount(Animation.INFINITE);
+            mRefreshIconView.startAnimation(mRefreshAnimation);
+            mRefreshIconView.setEnabled(false);
+        }
+    }
+
+    private void refreshAnimationStop() {
+        if (mRefreshIconView != null) {
+            mRefreshAnimation.setRepeatCount(0);
+            mRefreshIconView.setEnabled(true);
+        }
+    }
+
+    private void showPreferencesDialog() {
+        View view = LayoutInflater.from(this).inflate(R.layout.preferences_dialog, null);
+        Switch autoCheck = view.findViewById(R.id.preferences_auto_updates_check);
+        Switch autoDelete = view.findViewById(R.id.preferences_auto_delete_updates);
+        Switch dataWarning = view.findViewById(R.id.preferences_mobile_data_warning);
+        Switch abPerfMode = view.findViewById(R.id.preferences_ab_perf_mode);
+        Button updaterChannel = view.findViewById(R.id.preferences_custom_updater_uri);
+
+        if (!Utils.isABDevice()) {
+            abPerfMode.setVisibility(View.GONE);
+        }
+
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        autoCheck.setChecked(prefs.getBoolean(Constants.PREF_AUTO_UPDATES_CHECK, true));
+        autoDelete.setChecked(prefs.getBoolean(Constants.PREF_AUTO_DELETE_UPDATES, false));
+        dataWarning.setChecked(prefs.getBoolean(Constants.PREF_MOBILE_DATA_WARNING, true));
+        abPerfMode.setChecked(prefs.getBoolean(Constants.PREF_AB_PERF_MODE, false));
+        updaterChannel.setOnClickListener(v -> {
+            final AlertDialog alertDialog = new AlertDialog.Builder(this).create();
+            final EditText input = new EditText(this);
+            alertDialog.setTitle(R.string.menu_update_channel);
+            alertDialog.setMessage(this.getString(R.string.dialog_custom_updater_channel));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.MATCH_PARENT);
+            lp.setMargins(16, 16, 16, 16);
+            input.setLayoutParams(lp);
+            input.setText(prefs.getString(Constants.PREF_UPDATER_OVERRIDE_URI, ""));
+            alertDialog.setView(input);
+            alertDialog.setButton(DialogInterface.BUTTON_POSITIVE, getString(android.R.string.ok),
+                    (dialog, which) -> {
+                final String inputText = input.getText().toString();
+                if (!inputText.trim().isEmpty()) {
+                    prefs.edit().putString(Constants.PREF_UPDATER_OVERRIDE_URI, inputText).apply();
+                }
+                if (Utils.getCachedUpdateList(this).delete()) {
+                    Log.d(TAG, "Successfully deleted cached updates list");
+                }
+                downloadUpdatesList(true); // Force refresh
+            });
+            alertDialog.show();
+        });
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.menu_preferences)
+                .setView(view)
+                .setOnDismissListener(dialogInterface -> {
+                    prefs.edit()
+                            .putBoolean(Constants.PREF_AUTO_UPDATES_CHECK,
+                                    autoCheck.isChecked())
+                            .putBoolean(Constants.PREF_AUTO_DELETE_UPDATES,
+                                    autoDelete.isChecked())
+                            .putBoolean(Constants.PREF_MOBILE_DATA_WARNING,
+                                    dataWarning.isChecked())
+                            .putBoolean(Constants.PREF_AB_PERF_MODE,
+                                    abPerfMode.isChecked())
+                            .apply();
+
+                    if (autoCheck.isChecked()) {
+                        UpdatesCheckReceiver.scheduleRepeatingUpdatesCheck(this);
+                    } else {
+                        UpdatesCheckReceiver.cancelRepeatingUpdatesCheck(this);
+                        UpdatesCheckReceiver.cancelUpdatesCheck(this);
+                    }
+
+                    boolean enableABPerfMode = abPerfMode.isChecked();
+                    mUpdaterService.getUpdaterController().setPerformanceMode(enableABPerfMode);
+                })
+                .show();
     }
 }

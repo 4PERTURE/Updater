@@ -43,7 +43,6 @@ import org.lineageos.updater.model.UpdateInfo;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
-import java.io.FilenameFilter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Enumeration;
@@ -88,25 +87,24 @@ public class Utils {
         update.setName(object.getString("filename"));
         update.setDownloadId(object.getString("id"));
         update.setType(object.getString("romtype"));
+        update.setFileSize(object.getLong("size"));
         update.setDownloadUrl(object.getString("url"));
         update.setVersion(object.getString("version"));
         return update;
     }
 
     public static boolean isCompatible(UpdateBaseInfo update) {
-        if (update.getTimestamp() < SystemProperties.getLong(Constants.PROP_BUILD_DATE, 0)) {
-            Log.d(TAG, update.getName() + " is older than current build");
-            return false;
-        }
-        if (!update.getType().equalsIgnoreCase(SystemProperties.get(Constants.PROP_RELEASE_TYPE))) {
-            Log.d(TAG, update.getName() + " has type " + update.getType());
+        if (!SystemProperties.getBoolean(Constants.PROP_UPDATER_ALLOW_DOWNGRADING, false) &&
+                update.getTimestamp() <= SystemProperties.getLong(Constants.PROP_BUILD_DATE, 0)) {
+            Log.d(TAG, update.getName() + " is older than/equal to the current build");
             return false;
         }
         return true;
     }
 
     public static boolean canInstall(UpdateBaseInfo update) {
-        return update.getTimestamp() >= SystemProperties.getLong(Constants.PROP_BUILD_DATE, 0) &&
+        return (SystemProperties.getBoolean(Constants.PROP_UPDATER_ALLOW_DOWNGRADING, false) ||
+                update.getTimestamp() > SystemProperties.getLong(Constants.PROP_BUILD_DATE, 0)) &&
                 update.getVersion().equalsIgnoreCase(
                         SystemProperties.get(Constants.PROP_BUILD_VERSION));
     }
@@ -115,14 +113,14 @@ public class Utils {
             throws IOException, JSONException {
         List<UpdateInfo> updates = new ArrayList<>();
 
-        String json = "";
+        StringBuilder json = new StringBuilder();
         try (BufferedReader br = new BufferedReader(new FileReader(file))) {
             for (String line; (line = br.readLine()) != null;) {
-                json += line;
+                json.append(line);
             }
         }
 
-        JSONObject obj = new JSONObject(json);
+        JSONObject obj = new JSONObject(json.toString());
         JSONArray updatesList = obj.getJSONArray("response");
         for (int i = 0; i < updatesList.length(); i++) {
             if (updatesList.isNull(i)) {
@@ -136,7 +134,7 @@ public class Utils {
                     Log.d(TAG, "Ignoring incompatible update " + update.getName());
                 }
             } catch (JSONException e) {
-                Log.e(TAG, "Could not parse update object, index=" + i);
+                Log.e(TAG, "Could not parse update object, index=" + i, e);
             }
         }
 
@@ -144,15 +142,29 @@ public class Utils {
     }
 
     public static String getServerURL(Context context) {
-        String serverUrl = SystemProperties.get(Constants.PROP_UPDATER_URI);
-        if (serverUrl.trim().isEmpty()) {
-            serverUrl = context.getString(R.string.conf_update_server_url_def);
-        }
-        String incrementalVersion = SystemProperties.get(Constants.PROP_BUILD_VERSION_INCREMENTAL);
         String device = SystemProperties.get(Constants.PROP_NEXT_DEVICE,
                 SystemProperties.get(Constants.PROP_DEVICE));
-        String type = SystemProperties.get(Constants.PROP_RELEASE_TYPE).toLowerCase(Locale.ROOT);
-        return serverUrl + "/v1/" + device + "/" + type + "/" + incrementalVersion;
+        String type = BuildInfoUtils.getBuildType().toLowerCase(Locale.ROOT);
+
+        String serverUrl = SystemProperties.get(Constants.PROP_UPDATER_URI);
+        String overrideUrl = PreferenceManager.getDefaultSharedPreferences(context)
+                .getString(Constants.PREF_UPDATER_OVERRIDE_URI, "");
+        if (serverUrl.trim().isEmpty()) {
+            serverUrl = context.getString(R.string.updater_server_url);
+        }
+        if (overrideUrl != null && !overrideUrl.trim().isEmpty()) {
+            Log.d(TAG, "Overriding serverUrl with " + overrideUrl);
+            serverUrl = overrideUrl;
+        }
+
+        return serverUrl.replace("{device}", device)
+                .replace("{type}", type);
+    }
+
+    public static String getChangelogURL(Context context) {
+        String device = SystemProperties.get(Constants.PROP_NEXT_DEVICE,
+                SystemProperties.get(Constants.PROP_DEVICE));
+        return context.getString(R.string.menu_changelog_url, device);
     }
 
     public static void triggerUpdate(Context context, String downloadId) {
@@ -235,12 +247,8 @@ public class Utils {
     }
 
     public static void removeUncryptFiles(File downloadPath) {
-        File[] uncryptFiles = downloadPath.listFiles(new FilenameFilter() {
-            @Override
-            public boolean accept(File dir, String name) {
-                return name.endsWith(Constants.UNCRYPT_FILE_EXT);
-            }
-        });
+        File[] uncryptFiles = downloadPath.listFiles(
+                (dir, name) -> name.endsWith(Constants.UNCRYPT_FILE_EXT));
         if (uncryptFiles == null) {
             return;
         }
@@ -258,11 +266,26 @@ public class Utils {
      */
     public static void cleanupDownloadsDir(Context context) {
         File downloadPath = getDownloadPath(context);
+        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(context);
 
         removeUncryptFiles(downloadPath);
 
+        long buildTimestamp = SystemProperties.getLong(Constants.PROP_BUILD_DATE, 0);
+        long prevTimestamp = preferences.getLong(Constants.PREF_INSTALL_OLD_TIMESTAMP, 0);
+        String lastUpdatePath = preferences.getString(Constants.PREF_INSTALL_PACKAGE_PATH, null);
+        boolean reinstalling = preferences.getBoolean(Constants.PREF_INSTALL_AGAIN, false);
+        boolean deleteUpdates = preferences.getBoolean(Constants.PREF_AUTO_DELETE_UPDATES, false);
+        if ((buildTimestamp != prevTimestamp || reinstalling) && deleteUpdates &&
+                lastUpdatePath != null) {
+            File lastUpdate = new File(lastUpdatePath);
+            if (lastUpdate.exists()) {
+                lastUpdate.delete();
+                // Remove the pref not to delete the file if re-downloaded
+                preferences.edit().remove(Constants.PREF_INSTALL_PACKAGE_PATH).apply();
+            }
+        }
+
         final String DOWNLOADS_CLEANUP_DONE = "cleanup_done";
-        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(context);
         if (preferences.getBoolean(DOWNLOADS_CLEANUP_DONE, false)) {
             return;
         }
@@ -311,6 +334,10 @@ public class Utils {
             }
         }
         throw new IllegalStateException();
+    }
+
+    public static boolean isABDevice() {
+        return SystemProperties.getBoolean(Constants.PROP_AB_DEVICE, false);
     }
 
     public static boolean isABUpdate(ZipFile zipFile) {
